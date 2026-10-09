@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# locksight - finds potential deadlocks in a program before they happen.
+#
+#   locksight run ./my_program
+#
+# This script only handles the command line. It starts your program with the
+# LockSight library (liblocksight.so) preloaded; the library does the work.
+# See "locksight --help".
+
+VERSION="1.0"
+
+usage() {
+    cat <<'EOF'
+LockSight - finds potential deadlocks in a program before they happen.
+
+Usage:
+  locksight run [options] PROGRAM [PROGRAM-ARGUMENTS...]
+  locksight --help
+  locksight --version
+
+Options (they go BEFORE the program name):
+  --quiet       only print warnings, no summary
+  --log FILE    also save the full report to FILE (plain text, no colors)
+  --strict      stop the program the moment a problem is found
+
+Examples:
+  locksight run ./my_program
+  locksight run --log report.txt ./my_program --its-own-option
+  locksight run --strict ./my_program
+
+Exit status:
+  3      LockSight reported a potential deadlock or a self-deadlock
+  other  the exit status of PROGRAM itself (127 if it cannot be found)
+
+Colors are used only when the output is a terminal. Set NO_COLOR=1 to turn
+them off.
+EOF
+}
+
+die() {                          # die <message>
+    echo "locksight: $1" >&2
+    exit 2
+}
+
+case "${1:-}" in
+    run)             shift ;;
+    -h|--help|help)  usage; exit 0 ;;
+    -V|--version)    echo "LockSight $VERSION"; exit 0 ;;
+    "")              usage >&2; exit 2 ;;
+    *)               die "unknown command '$1' (try: locksight --help)" ;;
+esac
+
+# ---- options -------------------------------------------------------------
+quiet=0
+strict=0
+logfile=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --quiet)   quiet=1;  shift ;;
+        --strict)  strict=1; shift ;;
+        --log)     [ $# -ge 2 ] || die "--log needs a file name"
+                   logfile=$2; shift 2 ;;
+        --log=*)   logfile=${1#--log=}; shift ;;
+        --)        shift; break ;;
+        -*)        die "unknown option '$1' (try: locksight --help)" ;;
+        *)         break ;;       # the first non-option is the program
+    esac
+done
+
+if [ $# -lt 1 ]; then
+    echo "locksight: no program given" >&2
+    usage >&2
+    exit 2
+fi
+if ! command -v -- "$1" >/dev/null 2>&1; then
+    echo "locksight: cannot find program '$1'" >&2
+    exit 127
+fi
+
+# ---- find the library ----------------------------------------------------
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+HERE=$(dirname -- "$SELF")
+LIB=${LOCKSIGHT_LIB:-}
+if [ -z "$LIB" ]; then
+    for candidate in "$HERE/src/liblocksight.so" "$HERE/../lib/locksight/liblocksight.so"; do
+        if [ -f "$candidate" ]; then LIB=$candidate; break; fi
+    done
+fi
+if [ -z "$LIB" ] || [ ! -f "$LIB" ]; then
+    die "cannot find liblocksight.so (run 'make' in the LockSight folder first)"
+fi
+LIB=$(readlink -f -- "$LIB")
+
+# ---- log file and status file ---------------------------------------------
+if [ -n "$logfile" ]; then
+    : > "$logfile" 2>/dev/null || die "cannot write to log file '$logfile'"
+    logfile_abs=$(readlink -f -- "$logfile")   # absolute: the program may change directory
+fi
+STATUS=$(mktemp) || die "cannot create a temporary file"
+trap 'rm -f "$STATUS"' EXIT
+
+# ---- run the program -------------------------------------------------------
+export LD_PRELOAD="$LIB${LD_PRELOAD:+:$LD_PRELOAD}"
+export LOCKSIGHT_STATUS="$STATUS"
+[ "$quiet"  = 1 ] && export LOCKSIGHT_QUIET=1
+[ "$strict" = 1 ] && export LOCKSIGHT_STRICT=1
+[ -n "$logfile" ] && export LOCKSIGHT_LOG="$logfile_abs"
+
+# If the user presses Ctrl-C, the program (but not this script) should stop, so
+# that we can still report what was found. A handler (unlike "ignore") is
+# reset by the program, so the program still dies on Ctrl-C.
+trap : INT
+"$@"
+rc=$?
+trap - INT
+
+# ---- verdict ---------------------------------------------------------------
+problems=$(tr -cd 'W' < "$STATUS" | wc -c)
+summary_printed=$(tr -cd 'S' < "$STATUS" | wc -c)
+
+if [ "$problems" -gt 0 ] && [ "$quiet" = 0 ] && [ "$summary_printed" -eq 0 ]; then
+    # The program did not exit normally (it froze and was stopped, for example),
+    # so the library could not print its summary. Say what we know.
+    echo "[LockSight] $problems problem(s) were reported above." \
+         "The program did not exit normally, so no summary was printed." >&2
+fi
+if [ -n "$logfile" ] && [ "$quiet" = 0 ]; then
+    echo "[LockSight] report saved to $logfile" >&2
+fi
+
+if [ "$problems" -gt 0 ]; then
+    exit 3
+fi
+exit "$rc"

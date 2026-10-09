@@ -1,0 +1,25 @@
+# Compiled binaries and libraries
+*.so
+*.o
+tests/classic_deadlock
+tests/three_lock_cycle
+tests/safe_ordered
+tests/bank_transfer
+tests/dining_philosophers
+tests/single_thread_both_orders
+tests/gate_lock
+tests/partial_gate
+tests/self_deadlock
+tests/recursive_ok
+tests/errorcheck_ok
+tests/trylock_case
+tests/mutex_reuse
+tests/many_locks
+tests/big_ring
+tests/worker_pool_outlier
+tests/random_orders
+
+# Runtime artifacts and logs
+*.log
+report.txt
+*.tmp
