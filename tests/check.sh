@@ -79,6 +79,32 @@ check mutex_reuse           ""        SILENT 0
 echo "Stress test (memory reuse, recycling of LockSight's tables):"
 check many_locks "" SILENT 0 "(0 still tracked)"
 
+echo "Read-write locks (read = shared, write = exclusive):"
+check rwlock_mixed        "--lucky" WARN   0 "rwlock"
+check rwlock_mixed        ""        WARN 124
+check rwlock_rw_cycle     "--lucky" WARN   0 "(read)"
+check rwlock_rw_cycle     ""        WARN 124
+check rwlock_gate         "--lucky --shared" WARN 0
+check rwlock_gate         "--shared"         WARN 124
+check rwlock_upgrade      ""        WARN 124 "SELF-DEADLOCK"
+echo "Read-write locks that only LOOK risky (must stay silent):"
+check rwlock_readers_ok   "--lucky" SILENT 0
+check rwlock_readers_ok   ""        SILENT 0
+check rwlock_oneway_ok    "--lucky" SILENT 0
+check rwlock_oneway_ok    ""        SILENT 0
+check rwlock_gate         "--lucky" SILENT 0
+check rwlock_gate         ""        SILENT 0
+
+echo "Binary semaphores (sem_init(.., 1) = a lock) and hand-offs:"
+check sem_binary_deadlock "--lucky" WARN   0
+check sem_binary_deadlock ""        WARN 124
+check sem_binary_ok       ""        SILENT 0
+check sem_handoff_ok      ""        SILENT 0 "note: semaphore"
+check mutex_handoff_ok    ""        SILENT 0
+out=$(LD_PRELOAD="$LIB" timeout 30 ./tests/sem_binary_ok 2>&1 >/dev/null)
+if [[ "$out" != *"note:"* ]]; then report PASS "sem_binary_ok: no note (the posts come from the thread that waited)"
+else report FAIL "sem_binary_ok: an unexpected note was printed"; fi
+
 echo "Random programs checked against brute force (seeds 1-200):"
 tmp=$(mktemp)
 n_dead=0; n_safe=0; bad=""
@@ -99,6 +125,62 @@ else
     report FAIL "random_orders: LockSight and brute force disagree on seeds:$bad"
 fi
 
+echo "Random mutex + read-write lock programs checked by exhaustive search (seeds 1-200):"
+tmp=$(mktemp)
+n_dead=0; n_safe=0; bad=""
+for seed in $(seq 1 200); do
+    out=$(LD_PRELOAD="$LIB" timeout 10 ./tests/random_rw "$seed" 2>"$tmp")
+    expect=$(printf '%s\n' "$out" | sed -n 's/^EXPECT: //p')
+    warns=$(grep -c -E "$PATTERN" "$tmp")
+    if [ "$expect" = "DEADLOCK" ]; then
+        n_dead=$((n_dead + 1)); [ "$warns" -ge 1 ] || bad="$bad $seed"
+    else
+        n_safe=$((n_safe + 1)); [ "$warns" -eq 0 ] || bad="$bad $seed"
+    fi
+done
+rm -f "$tmp"
+if [ -z "$bad" ]; then
+    report PASS "random_rw: all 200 verdicts match ($n_dead with a possible deadlock, $n_safe safe)"
+else
+    report FAIL "random_rw: LockSight and the exhaustive search disagree on seeds:$bad"
+fi
+
+
+echo "Many locks (the tables and the speed of adding edges):"
+SECONDS=0
+check hub_many "" SILENT 0 "NO PROBLEMS FOUND"
+if [ "$SECONDS" -le 10 ]; then
+    report PASS "hub_many: 50000 locks under one hub lock took ${SECONDS}s (must be 10s or less)"
+else
+    report FAIL "hub_many took ${SECONDS}s: adding edges has become slow"
+fi
+tmp=$(mktemp)
+bad=""
+for seed in $(seq 1 100); do
+    LD_PRELOAD="$LIB" timeout 30 ./tests/random_many "$seed" 0 >/dev/null 2>"$tmp"
+    [ "$(grep -c -E "$PATTERN" "$tmp")" -eq 0 ] || bad="$bad $seed"
+done
+rm -f "$tmp"
+if [ -z "$bad" ]; then
+    report PASS "random_many: 100 big programs with a global lock order, no warnings"
+else
+    report FAIL "random_many: false warnings on seeds:$bad"
+fi
+tmp=$(mktemp)
+miss=""
+for seed in $(seq 1 100); do
+    LD_PRELOAD="$LIB" timeout 30 ./tests/random_many "$seed" 100 >/dev/null 2>"$tmp"
+    [ "$(grep -c -E "$PATTERN" "$tmp")" -ge 1 ] || miss="$miss $seed"
+done
+rm -f "$tmp"
+# With every chain shuffled, almost every program has a possible deadlock; a few
+# small ones may be safe by chance, so allow a handful of silent seeds.
+nmiss=$(echo $miss | wc -w)
+if [ "$nmiss" -le 10 ]; then
+    report PASS "random_many: shuffled chains: $((100 - nmiss))/100 programs warn (fully shuffled programs nearly always can deadlock)"
+else
+    report FAIL "random_many: only $((100 - nmiss))/100 shuffled programs gave a warning"
+fi
 
 echo "Command-line tool (./locksight):"
 
@@ -164,6 +246,92 @@ if command -v script >/dev/null 2>&1; then
 else
     echo "  SKIP  terminal color tests (the 'script' command is not installed)"
 fi
+
+echo "JSON output (--json FILE, one JSON object per line):"
+
+# json_ok FILE -> every line is valid JSON (python3 or jq if present, else a structural check)
+json_ok() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import json,sys
+for l in open(sys.argv[1]): json.loads(l)' "$1" 2>/dev/null
+    elif command -v jq >/dev/null 2>&1; then
+        jq -e . "$1" >/dev/null 2>&1
+    else
+        ! grep -v -q -E '^\{.*\}$' "$1"
+    fi
+}
+if command -v python3 >/dev/null 2>&1; then jmode="validated with python3"
+elif command -v jq >/dev/null 2>&1; then jmode="validated with jq"
+else jmode="structure only: install python3 or jq for full validation"; fi
+
+jf=$(mktemp)
+cli_case "--json: bug found, exit 3, text report still printed" 3 "POTENTIAL DEADLOCK" "" "" -- ./locksight run --json "$jf" ./tests/bank_transfer --lucky
+if json_ok "$jf" && grep -q '"event":"potential_deadlock"' "$jf" && grep -q '"event":"summary"' "$jf" \
+   && grep -q '"potential_deadlocks":1' "$jf" && grep -q '"result":"problems_found"' "$jf"; then
+    report PASS "--json: valid, has potential_deadlock + summary events ($jmode)"
+else report FAIL "--json: file is invalid or incomplete"; fi
+if grep -q '"file":"bank_transfer.c"' "$jf" && grep -q '"function":"transfer"' "$jf" && grep -q -E '"line":[0-9]+' "$jf" \
+   && grep -q '"mode":"exclusive"' "$jf" && grep -q '"kind":"mutex"' "$jf" && grep -q '"thread":' "$jf"; then
+    report PASS "--json: locks, threads, modes and file/line/function are structured fields"
+else report FAIL "--json: structured fields are missing"; fi
+
+cli_case "--json with --quiet: no text summary on screen" 3 "POTENTIAL DEADLOCK" "Summary" "" -- ./locksight run --quiet --json "$jf" ./tests/bank_transfer --lucky
+if json_ok "$jf" && grep -q '"event":"summary"' "$jf"; then report PASS "--json with --quiet: the file still gets the summary event"
+else report FAIL "--json with --quiet: summary event missing"; fi
+
+LOCKSIGHT_COLOR=always ./locksight run --json "$jf" ./tests/bank_transfer --lucky >/dev/null 2>&1
+if json_ok "$jf" && ! grep -q $'\033' "$jf" && ! grep -q $'\001' "$jf"; then report PASS "--json: no color codes or markers in the file"
+else report FAIL "--json: the file contains color codes"; fi
+
+./locksight run --json "$jf" ./tests/safe_ordered >/dev/null 2>&1
+if json_ok "$jf" && [ "$(grep -c '"event"' "$jf")" -eq 1 ] && grep -q '"result":"no_problems"' "$jf"; then
+    report PASS "--json: a correct program gives only a summary with no_problems"
+else report FAIL "--json: correct program output is wrong"; fi
+
+./locksight run --json "$jf" ./tests/self_deadlock >/dev/null 2>&1
+if json_ok "$jf" && grep -q '"event":"self_deadlock"' "$jf" && grep -q '"requested_at"' "$jf"; then
+    report PASS "--json: self_deadlock event is written at once (the program froze, no summary)"
+else report FAIL "--json: self_deadlock event missing"; fi
+
+./locksight run --json "$jf" ./tests/rwlock_rw_cycle --lucky >/dev/null 2>&1
+if json_ok "$jf" && grep -q '"mode":"shared"' "$jf" && grep -q '"kind":"rwlock"' "$jf"; then
+    report PASS "--json: rwlock locks and shared/exclusive modes are reported"
+else report FAIL "--json: rwlock modes missing"; fi
+
+./locksight run --json "$jf" ./tests/sem_handoff_ok >/dev/null 2>&1
+if json_ok "$jf" && grep -q '"note":"semaphore_signaling"' "$jf"; then
+    report PASS "--json: the semaphore note is an event"
+else report FAIL "--json: semaphore note missing"; fi
+
+# a program built without -g has no line numbers: they must be null, never 0
+wd0=$(mktemp -d)
+if gcc -O0 -pthread -o "$wd0/nodebug" tests/classic_deadlock.c 2>/dev/null; then
+    LD_PRELOAD="$LIB" LOCKSIGHT_JSON="$jf" "$wd0/nodebug" --lucky >/dev/null 2>&1
+    if json_ok "$jf" && grep -q '"event":"potential_deadlock"' "$jf" && ! grep -q '"line":0' "$jf"; then
+        report PASS "--json: a program without debug info still gives valid JSON (no line 0)"
+    else report FAIL "--json: no-debug-info output is wrong"; fi
+else report FAIL "--json: could not build the no-debug-info test"; fi
+rm -rf "$wd0"
+
+# odd file names and an event too big for the buffer must still give valid JSON
+wd=$(mktemp -d)
+mkdir -p "$wd/dir"
+cp tests/classic_deadlock.c "$wd/dir/a\"b.c"; cp tests/common.h "$wd/dir/"
+if gcc -g -O0 -pthread -o "$wd/q" "$wd/dir/a\"b.c" 2>/dev/null; then
+    LD_PRELOAD="$LIB" LOCKSIGHT_JSON="$jf" "$wd/q" --lucky >/dev/null 2>&1
+    if json_ok "$jf" && grep -q -F '"file":"a\"b.c"' "$jf"; then report PASS "--json: a quote in a file name is escaped correctly"
+    else report FAIL "--json: escaping is broken"; fi
+else report FAIL "--json: could not build the odd-file-name test"; fi
+if gcc -shared -fPIC -O2 -g -pthread -DJSON_SIZE=1800 -o "$wd/small.so" src/liblocksight.c -ldl 2>/dev/null; then
+    LD_PRELOAD="$wd/small.so" LOCKSIGHT_JSON="$jf" ./tests/big_ring 50 >/dev/null 2>&1
+    if json_ok "$jf" && grep -q '"details_truncated":true' "$jf" && grep -q '"event":"summary"' "$jf"; then
+        report PASS "--json: an event that does not fit is replaced by a short valid line"
+    else report FAIL "--json: overflow handling is broken"; fi
+else report FAIL "--json: could not build the small-buffer test"; fi
+rm -rf "$wd" "$jf"
+
+cli_case "--json without a file name -> exit 2"             2 "needs a file name" "" "" -- ./locksight run --json
+cli_case "--json to an unwritable place -> exit 2"          2 "cannot write to JSON file" "" "" -- ./locksight run --json /no/such/dir/x.jsonl ./tests/safe_ordered
 
 inst=$(mktemp -d)
 make -s install PREFIX="$inst" >/dev/null 2>&1

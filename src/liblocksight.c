@@ -29,13 +29,40 @@
  * To check (2), every edge remembers which locks its thread held at that
  * moment. (This is the idea of the "GoodLock" family of detectors.)
  *
+ * READ-WRITE LOCKS (Phase 6)
+ * ---------------------------
+ * pthread_rwlock_rdlock / wrlock (and try / timed variants) are tracked with
+ * a MODE: a read lock is SHARED, a write lock is EXCLUSIVE. Readers do not
+ * block each other, so the two filters above become mode-aware:
+ *   - A step "thread X holds L and asks for M" only blocks on a thread that
+ *     holds M in a CONFLICTING mode (anything except read with read).
+ *   - A lock held by two threads is a "gate" only if at least one of them
+ *     holds it exclusively. Two readers of the same lock are not kept apart.
+ * Every edge therefore stores the mode it was held in and the mode requested,
+ * plus a second bit set with the locks held exclusively.
+ * (glibc's default lets readers go first, so a reader is not blocked by a
+ * WAITING writer; a program that asks for writer preference could deadlock
+ * in ways this model does not see.)
+ *
+ * BINARY SEMAPHORES (Phase 6)
+ * ---------------------------
+ * A semaphore has no owner. sem_init(&s, 0, 1) (value 1) makes LockSight treat
+ * it as a lock: the thread that sem_wait()s it holds it until its own
+ * sem_post(). Semaphores with another initial value are signals and are not
+ * tracked. If a tracked semaphore is posted by a thread that never waited on
+ * it, it is really a signal: LockSight prints a note and removes it from the
+ * graph. Other threads' lists of held locks are never edited from outside:
+ * they carry a generation number, and an entry from an older generation is
+ * ignored (the same mechanism handles a mutex released by another thread).
+ *
  * OTHER THINGS HANDLED
  * --------------------
- *  - Self-deadlock: a thread locks a normal mutex it already holds.
+ *  - Self-deadlock: a thread locks a normal mutex it already holds, or asks
+ *    for a write lock while holding a read lock on the same rwlock.
  *  - Recursive / error-checking mutexes may be locked again: no warning.
  *  - pthread_mutex_destroy / pthread_mutex_init: the history of a mutex is
  *    forgotten, because the same memory address may later hold a new mutex.
- *  - pthread_mutex_trylock never waits, so it adds no edge.
+ *  - trylock and timed locks never wait forever, so they add no edge.
  *  - LockSight's own work (printing, addr2line) is never tracked
  *    (the "re-entrancy guard" t_busy).
  *
@@ -55,39 +82,79 @@
 #include <fcntl.h>
 #include <link.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /* Limits. Fixed-size tables mean we never call malloc while tracking, */
 /* which keeps the interceptor simple and safe.                        */
 /* ------------------------------------------------------------------ */
-#define MAX_LOCKS      2048     /* mutexes tracked at the same time          */
-#define HASH_SIZE      8192     /* lock-address hash table (> 4 x MAX_LOCKS) */
-#define MAX_EDGES      16384    /* "A held while taking B" records           */
+/* The size limits can be changed when building, for example
+ *     make LIMITS="-DMAX_LOCKS=1000000 -DMAX_EDGES=1000000"
+ * (HASH_SIZE and PAIR_HASH follow automatically). The memory is reserved but
+ * only used as locks and edges really appear. */
+#ifndef MAX_LOCKS
+#define MAX_LOCKS      65536    /* locks tracked at the same time            */
+#endif
+#ifndef HASH_SIZE
+#define HASH_SIZE      (4 * MAX_LOCKS)  /* lock-address hash table           */
+#endif
+#ifndef MAX_EDGES
+#define MAX_EDGES      262144   /* "A held while taking B" records           */
+#endif
+#ifndef PAIR_HASH
+#define PAIR_HASH      MAX_EDGES        /* index of edges by (from, to)      */
+#endif
 #define MAX_HELD       64       /* locks one thread can hold at once         */
 #define MAX_FRAMES     8        /* call-stack frames saved per edge          */
 #define MAX_CYCLE      16       /* longest cycle printed in full             */
 #define MAX_DEPTH      256      /* longest cycle we search for               */
-#define MAX_PER_EDGE   4        /* different threads remembered per A->B pair */
+#define MAX_PER_EDGE   4        /* different threads remembered per A->B pair
+                                   (and per combination of lock modes)        */
 #define GATE_BITS      256      /* locks 0..255 can act as "gate" locks      */
 #define GATE_WORDS     (GATE_BITS / 64)
-#define SEARCH_BUDGET  200000   /* steps one cycle search may take           */
+#define SEARCH_BUDGET  200000   /* edges one cycle search may look at        */
+#define SEARCH_TOTAL   60000000 /* edges ALL cycle searches may look at; after
+                                   that new edges are no longer checked       */
+#define MAX_BACK       4096     /* "cycle" edges set aside by the lock ordering */
 #define MAX_WARNINGS   20       /* stop printing after this many warnings    */
 #define OUT_SIZE       24576    /* size of the warning text buffer           */
+
+/* What kind of synchronization object a "lock" is, and in which MODE a thread
+ * holds it or asks for it. A read lock (pthread_rwlock_rdlock) is SHARED: any
+ * number of readers can hold it together. Everything else is EXCLUSIVE: mutex,
+ * write lock, binary semaphore. Two modes CONFLICT unless both are shared. */
+#define KIND_MUTEX   0
+#define KIND_RWLOCK  1
+#define KIND_SEM     2
+#define MODE_X       0
+#define MODE_S       1
+
+static int conflicts(int mode_a, int mode_b)
+{
+    return !(mode_a == MODE_S && mode_b == MODE_S);
+}
 
 /* ------------------------------------------------------------------ */
 /* Data structures                                                     */
 /* ------------------------------------------------------------------ */
 
-/* One tracked mutex. We identify a mutex by its memory address. */
+/* One tracked lock (mutex, rwlock or binary semaphore). We identify a lock by
+ * its memory address. */
 typedef struct {
-    void *addr;        /* address of the pthread_mutex_t                    */
-    void *first_pc;    /* where in the program we first saw it being used   */
+    void    *addr;     /* address of the pthread_mutex_t / rwlock_t / sem_t */
+    void    *first_pc; /* where in the program we first saw it being used   */
+    int      kind;     /* KIND_MUTEX, KIND_RWLOCK or KIND_SEM               */
+    unsigned gen;      /* generation: raised whenever "who holds this lock"
+                          becomes unknown (flush / hand-off). A thread's own
+                          list of held locks remembers the generation it saw;
+                          entries with an old generation are ignored.        */
 } LockInfo;
 
 /* One record of the lock-order graph:  "thread 'tid' asked for lock 'to'
@@ -96,10 +163,22 @@ typedef struct {
 typedef struct {
     int      from, to;               /* lock ids                              */
     int      tid;                    /* the thread this record belongs to     */
+    unsigned char hmode, rmode;      /* mode in which 'from' was HELD / 'to'
+                                        was REQUESTED (MODE_X or MODE_S)      */
+    unsigned char hkind, rkind;      /* KIND_* of 'from' and of 'to'          */
     int      next_out, next_in;      /* lists of edges leaving 'from' and
                                         entering 'to' (index+1, 0 = end)      */
+    int      prev_out, prev_in;      /* the same lists backwards, so that an
+                                        edge can be removed in O(1)           */
+    int      next_pair;              /* chain of edges with the same (from,to)
+                                        hash bucket (index+1, 0 = end)        */
+    unsigned char back;              /* 1 = this edge closes a loop in the plain
+                                        lock graph; it is set aside from the
+                                        lock ordering (see "Lock ordering")   */
     uint64_t held[GATE_WORDS];       /* set of locks the thread held at that
                                         moment (bit n = lock id n)            */
+    uint64_t hx[GATE_WORDS];         /* the subset held EXCLUSIVELY (only these
+                                        can keep another thread out)          */
     void    *from_pc;                /* where 'from' had been acquired        */
     void    *to_stack[MAX_FRAMES];   /* call stack where 'to' was requested   */
     int      to_depth;               /* number of valid entries in to_stack   */
@@ -107,9 +186,11 @@ typedef struct {
 
 /* One lock currently held by the calling thread. */
 typedef struct {
-    void *addr;
-    int   id;
-    void *pc;          /* where it was acquired */
+    void    *addr;
+    int      id;
+    int      mode;     /* MODE_X or MODE_S                    */
+    unsigned gen;      /* generation of the lock when taken   */
+    void    *pc;       /* where it was acquired               */
 } Held;
 
 /* A cycle copied out of the graph so we can print it without holding locks. */
@@ -128,6 +209,7 @@ typedef struct {
     void    *req_stack[MAX_FRAMES]; /* where it asks for it again             */
     int      req_depth;
     int      id, tid, number;
+    int      kind;                  /* KIND_MUTEX or KIND_RWLOCK              */
 } SelfDeadlock;
 
 /* ------------------------------------------------------------------ */
@@ -149,6 +231,12 @@ static int      g_nedges_hw;
 static int      g_nedges_seen;
 static int      g_first_out[MAX_LOCKS];     /* per lock: first edge leaving it + 1 */
 static int      g_first_in[MAX_LOCKS];      /* per lock: first edge entering it + 1 */
+static int      g_pair_head[PAIR_HASH];     /* (from,to) hash bucket: first edge + 1 */
+static uint64_t g_ord[MAX_LOCKS];           /* position of each lock in the lock ordering */
+static uint64_t g_next_ord;
+static int      g_back[MAX_BACK];           /* edges set aside (flag "back")        */
+static int      g_nback, g_back_overflow;
+static long     g_search_total;             /* edges looked at by all searches so far */
 
 /* Scratch space for the cycle search. */
 static unsigned g_mark[MAX_LOCKS];          /* "on the current path" marks     */
@@ -160,6 +248,7 @@ static long     g_budget;
 static int      g_nthreads, g_ncycles, g_nself;
 static int      g_dropped_locks, g_dropped_edges, g_budget_hits;
 static int      g_warnings_printed;
+static int      g_nnotes;                   /* semaphores dropped from tracking  */
 
 static pthread_mutex_t g_mutex       = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_print_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -181,10 +270,34 @@ static int (*real_trylock)(pthread_mutex_t *);
 static int (*real_unlock)(pthread_mutex_t *);
 static int (*real_init)(pthread_mutex_t *, const pthread_mutexattr_t *);
 static int (*real_destroy)(pthread_mutex_t *);
+static int (*real_timedlock)(pthread_mutex_t *, const struct timespec *);
+
+static int (*real_rdlock)(pthread_rwlock_t *);
+static int (*real_wrlock)(pthread_rwlock_t *);
+static int (*real_tryrdlock)(pthread_rwlock_t *);
+static int (*real_trywrlock)(pthread_rwlock_t *);
+static int (*real_timedrdlock)(pthread_rwlock_t *, const struct timespec *);
+static int (*real_timedwrlock)(pthread_rwlock_t *, const struct timespec *);
+static int (*real_rw_unlock)(pthread_rwlock_t *);
+static int (*real_rw_init)(pthread_rwlock_t *, const pthread_rwlockattr_t *);
+static int (*real_rw_destroy)(pthread_rwlock_t *);
+
+static int (*real_sem_init)(sem_t *, int, unsigned int);
+static int (*real_sem_destroy)(sem_t *);
+static int (*real_sem_wait)(sem_t *);
+static int (*real_sem_trywait)(sem_t *);
+static int (*real_sem_timedwait)(sem_t *, const struct timespec *);
+static int (*real_sem_post)(sem_t *);
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 30)
+static int (*real_sem_clockwait)(sem_t *, clockid_t, const struct timespec *);
+#endif
+#endif
 
 static void init_real(void)
 {
-    if (real_lock && real_trylock && real_unlock && real_init && real_destroy)
+    if (real_lock && real_trylock && real_unlock && real_init && real_destroy &&
+        real_sem_post && real_rw_unlock)
         return;
     /* Looking these up twice (two threads racing) is harmless. */
     real_lock    = (int (*)(pthread_mutex_t *))dlsym(RTLD_NEXT, "pthread_mutex_lock");
@@ -193,6 +306,35 @@ static void init_real(void)
     real_init    = (int (*)(pthread_mutex_t *, const pthread_mutexattr_t *))
                        dlsym(RTLD_NEXT, "pthread_mutex_init");
     real_destroy = (int (*)(pthread_mutex_t *))dlsym(RTLD_NEXT, "pthread_mutex_destroy");
+    real_timedlock = (int (*)(pthread_mutex_t *, const struct timespec *))
+                         dlsym(RTLD_NEXT, "pthread_mutex_timedlock");
+
+    real_rdlock  = (int (*)(pthread_rwlock_t *))dlsym(RTLD_NEXT, "pthread_rwlock_rdlock");
+    real_wrlock  = (int (*)(pthread_rwlock_t *))dlsym(RTLD_NEXT, "pthread_rwlock_wrlock");
+    real_tryrdlock = (int (*)(pthread_rwlock_t *))dlsym(RTLD_NEXT, "pthread_rwlock_tryrdlock");
+    real_trywrlock = (int (*)(pthread_rwlock_t *))dlsym(RTLD_NEXT, "pthread_rwlock_trywrlock");
+    real_timedrdlock = (int (*)(pthread_rwlock_t *, const struct timespec *))
+                           dlsym(RTLD_NEXT, "pthread_rwlock_timedrdlock");
+    real_timedwrlock = (int (*)(pthread_rwlock_t *, const struct timespec *))
+                           dlsym(RTLD_NEXT, "pthread_rwlock_timedwrlock");
+    real_rw_init = (int (*)(pthread_rwlock_t *, const pthread_rwlockattr_t *))
+                       dlsym(RTLD_NEXT, "pthread_rwlock_init");
+    real_rw_destroy = (int (*)(pthread_rwlock_t *))dlsym(RTLD_NEXT, "pthread_rwlock_destroy");
+    real_rw_unlock = (int (*)(pthread_rwlock_t *))dlsym(RTLD_NEXT, "pthread_rwlock_unlock");
+
+    real_sem_init    = (int (*)(sem_t *, int, unsigned int))dlsym(RTLD_NEXT, "sem_init");
+    real_sem_destroy = (int (*)(sem_t *))dlsym(RTLD_NEXT, "sem_destroy");
+    real_sem_wait    = (int (*)(sem_t *))dlsym(RTLD_NEXT, "sem_wait");
+    real_sem_trywait = (int (*)(sem_t *))dlsym(RTLD_NEXT, "sem_trywait");
+    real_sem_timedwait = (int (*)(sem_t *, const struct timespec *))
+                             dlsym(RTLD_NEXT, "sem_timedwait");
+    real_sem_post    = (int (*)(sem_t *))dlsym(RTLD_NEXT, "sem_post");
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 30)
+    real_sem_clockwait = (int (*)(sem_t *, clockid_t, const struct timespec *))
+                             dlsym(RTLD_NEXT, "sem_clockwait");
+#endif
+#endif
 }
 
 /* ================================================================== */
@@ -430,6 +572,8 @@ static void describe(void *pc, char *out, size_t cap, int *has_line)
  *   LOCKSIGHT_QUIET=1     only warnings, no summary           (--quiet)
  *   LOCKSIGHT_STRICT=1    stop the program at the first problem (--strict)
  *   LOCKSIGHT_LOG=file    also append a plain-text copy to a file (--log)
+ *   LOCKSIGHT_JSON=file   also append one JSON object per line (JSON Lines)
+ *                         for every event, for scripts and dashboards (--json)
  *   LOCKSIGHT_STATUS=file the launcher reads this to learn whether anything
  *                         was reported, so it can return exit status 3
  *   LOCKSIGHT_COLOR=always|never|auto   (auto = only when stderr is a terminal)
@@ -439,6 +583,7 @@ static int  g_config_loaded;
 static int  g_quiet, g_strict, g_color;
 static char g_logpath[1024];
 static char g_statuspath[1024];
+static char g_jsonpath[1024];
 
 static int env_flag(const char *name)
 {
@@ -458,6 +603,9 @@ static void load_config(void)
     const char *v = getenv("LOCKSIGHT_LOG");
     if (v)
         snprintf(g_logpath, sizeof g_logpath, "%s", v);
+    v = getenv("LOCKSIGHT_JSON");
+    if (v)
+        snprintf(g_jsonpath, sizeof g_jsonpath, "%s", v);
     v = getenv("LOCKSIGHT_STATUS");
     if (v)
         snprintf(g_statuspath, sizeof g_statuspath, "%s", v);
@@ -634,6 +782,238 @@ static void write_out(size_t len)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* JSON Lines output (--json FILE)                                      */
+/*                                                                      */
+/* One JSON object per line, one line per event: potential_deadlock,    */
+/* self_deadlock, note, strict_stop and summary. It is written next to  */
+/* the human-readable text and independent of --quiet and colors. The   */
+/* line is built in a fixed buffer; if an event would not fit, a short  */
+/* (still valid) line saying "details_truncated" is written instead.    */
+/* The caller holds g_print_mutex.                                      */
+/* ------------------------------------------------------------------ */
+#ifndef JSON_SIZE
+#define JSON_SIZE 131072
+#endif
+static char   g_json[JSON_SIZE];
+static size_t g_jlen;
+static int    g_jover;
+
+static void jprintf(const char *fmt, ...)
+{
+    if (g_jover)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(g_json + g_jlen, JSON_SIZE - g_jlen - 2, fmt, ap);   /* room for "}\n" */
+    va_end(ap);
+    if (n < 0 || (size_t)n >= JSON_SIZE - g_jlen - 2)
+        g_jover = 1;
+    else
+        g_jlen += (size_t)n;
+}
+
+/* A JSON string, escaped. Bytes that are not valid UTF-8 become '?'. */
+static void jstr(const char *t)
+{
+    jprintf("\"");
+    for (const unsigned char *p = (const unsigned char *)(t ? t : ""); *p; ) {
+        unsigned char c = *p;
+        if (c == '"' || c == '\\') {
+            jprintf("\\%c", c);
+            p++;
+        } else if (c < 0x20) {
+            jprintf("\\u%04x", c);
+            p++;
+        } else if (c < 0x80) {
+            jprintf("%c", c);
+            p++;
+        } else {
+            int need = (c >= 0xF0 && c <= 0xF4) ? 3 : (c >= 0xE0) ? 2 : (c >= 0xC2 && c < 0xE0) ? 1 : -1;
+            int ok = need > 0 && c <= 0xF4;
+            for (int k = 1; ok && k <= need; k++)
+                if ((p[k] & 0xC0) != 0x80)
+                    ok = 0;
+            if (!ok) {
+                jprintf("?");
+                p++;
+            } else {
+                for (int k = 0; k <= need; k++)
+                    jprintf("%c", p[k]);
+                p += need + 1;
+            }
+        }
+    }
+    jprintf("\"");
+}
+
+/* A source location as an object: {"file":..,"line":..,"function":..,"pc":".."}
+ * (file/line/function are null when the program has no debug info). */
+static void jloc(void *pc)
+{
+    char text[600], loc[300], func[300];
+    int has_line = 0;
+    describe(pc, text, sizeof text, &has_line);
+    jprintf("{\"pc\":\"%p\",", pc);
+    const char *paren = has_line ? strstr(text, " (") : NULL;
+    if (paren) {
+        size_t ll = (size_t)(paren - text);
+        if (ll >= sizeof loc) ll = sizeof loc - 1;
+        memcpy(loc, text, ll);
+        loc[ll] = '\0';
+        snprintf(func, sizeof func, "%s", paren + 2);
+        size_t fl = strlen(func);
+        if (fl > 0 && func[fl - 1] == ')')
+            func[fl - 1] = '\0';
+        char *colon = strrchr(loc, ':');
+        jprintf("\"file\":");
+        if (colon) {
+            *colon = '\0';
+            jstr(loc);
+            int ln = atoi(colon + 1);
+            if (ln > 0) jprintf(",\"line\":%d", ln);
+            else        jprintf(",\"line\":null");
+        }
+        else       { jstr(loc);                 jprintf(",\"line\":null"); }
+        jprintf(",\"function\":");
+        jstr(func);
+    } else {
+        jprintf("\"file\":null,\"line\":null,\"function\":null,\"text\":");
+        jstr(text);
+    }
+    jprintf("}");
+}
+
+/* Up to three "called from" locations (frames with line info), as an array. */
+static void jcallers(void *const *stack, int depth)
+{
+    char dummy[600];
+    int shown = 0;
+    jprintf("[");
+    for (int f = 1; f < depth && shown < 3; f++) {
+        int has_line;
+        describe(stack[f], dummy, sizeof dummy, &has_line);
+        if (has_line) {
+            jprintf("%s", shown ? "," : "");
+            jloc(stack[f]);
+            shown++;
+        }
+    }
+    jprintf("]");
+}
+
+static const char *json_mode(int kind, int mode)
+{
+    return (kind == KIND_RWLOCK && mode == MODE_S) ? "shared" : "exclusive";
+}
+
+/* Start an event line: {"schema":..,"event":..,"pid":..,"time":..  (more follows) */
+static void json_begin(const char *event)
+{
+    struct timespec ts;
+    struct tm tm;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    gmtime_r(&ts.tv_sec, &tm);
+    g_jlen  = 0;
+    g_jover = 0;
+    jprintf("{\"schema\":\"locksight/1\",\"event\":\"%s\",\"pid\":%d,"
+            "\"time\":\"%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ\"",
+            event, (int)getpid(), tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+            tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000L);
+}
+
+/* Finish and write the line. 'fallback_tail' is what to write instead if the
+ * event did not fit (it must be valid JSON that closes the object). */
+static void json_end(const char *fallback_tail)
+{
+    if (!g_jsonpath[0])
+        return;
+    if (g_jover) {
+        /* Keep schema/event/pid/time and the event number, drop the rest. */
+        char *num = strstr(g_json, ",\"number\":");
+        size_t keep = 0;
+        if (num) {
+            keep = (size_t)(num - g_json) + 10;
+            while (g_json[keep] >= '0' && g_json[keep] <= '9')
+                keep++;
+        }
+        g_jlen  = keep;
+        g_jover = 0;
+        jprintf("%s", fallback_tail);
+    }
+    g_json[g_jlen++] = '}';
+    g_json[g_jlen++] = '\n';
+    append_file(g_jsonpath, g_json, g_jlen);
+}
+
+static void json_lock(int id1, int kind, void *addr, void *first_pc)
+{
+    jprintf("{\"id\":%d,\"kind\":\"%s\",\"address\":\"%p\",\"first_used_at\":", id1,
+            kind == KIND_RWLOCK ? "rwlock" : kind == KIND_SEM ? "semaphore" : "mutex", addr);
+    jloc(first_pc);
+    jprintf("}");
+}
+
+static void json_cycle(const Cycle *c)
+{
+    if (!g_jsonpath[0])
+        return;
+    json_begin("potential_deadlock");
+    jprintf(",\"number\":%d,\"cycle_length\":%d,\"truncated\":%s,\"locks\":[",
+            c->number, c->total, c->total > c->n ? "true" : "false");
+    for (int i = 0; i < c->n; i++) {
+        jprintf("%s", i ? "," : "");
+        json_lock(c->e[i].from + 1, c->l[i].kind, c->l[i].addr, c->l[i].first_pc);
+    }
+    jprintf("],\"steps\":[");
+    for (int i = 0; i < c->n; i++) {
+        const Edge *e = &c->e[i];
+        jprintf("%s{\"thread\":%d,\"holds\":{\"lock\":%d,\"mode\":\"%s\",\"acquired_at\":",
+                i ? "," : "", e->tid, e->from + 1, json_mode(e->hkind, e->hmode));
+        jloc(e->from_pc);
+        jprintf("},\"requests\":{\"lock\":%d,\"mode\":\"%s\",\"requested_at\":",
+                e->to + 1, json_mode(e->rkind, e->rmode));
+        jloc(e->to_depth > 0 ? e->to_stack[0] : NULL);
+        jprintf(",\"called_from\":");
+        jcallers(e->to_stack, e->to_depth);
+        jprintf("}}");
+    }
+    jprintf("],\"fix\":\"make every thread take these locks in the same order\"");
+    json_end(",\"details_truncated\":true");
+}
+
+static void json_self(const SelfDeadlock *s)
+{
+    if (!g_jsonpath[0])
+        return;
+    json_begin("self_deadlock");
+    jprintf(",\"number\":%d,\"thread\":%d,\"lock\":", s->number, s->tid);
+    json_lock(s->id + 1, s->kind, s->lock.addr, s->lock.first_pc);
+    jprintf(",\"held_at\":");
+    jloc(s->held_pc);
+    jprintf(",\"requested_at\":");
+    jloc(s->req_depth > 0 ? s->req_stack[0] : NULL);
+    jprintf(",\"called_from\":");
+    jcallers(s->req_stack, s->req_depth);
+    jprintf(",\"fix\":\"%s\"", s->kind == KIND_RWLOCK
+            ? "release the read lock first, or take the write lock from the start"
+            : "unlock before locking again, or use a recursive mutex if intended");
+    json_end(",\"details_truncated\":true");
+}
+
+static const char *kind_name(int kind)
+{
+    return kind == KIND_RWLOCK ? "rwlock" : kind == KIND_SEM ? "semaphore" : "mutex";
+}
+
+/* " (read)" / " (write)" for rwlocks, nothing for other locks. */
+static const char *mode_word(int kind, int mode)
+{
+    if (kind != KIND_RWLOCK)
+        return "";
+    return mode == MODE_S ? " (read)" : " (write)";
+}
+
 static void print_cycle(const Cycle *c)
 {
     char where[600];
@@ -677,16 +1057,17 @@ static void print_cycle(const Cycle *c)
     bprintf(&len, "  Locks involved:\n");
     for (int i = 0; i < c->n; i++) {
         describe(c->l[i].first_pc, where, sizeof where, NULL);
-        bprintf(&len, C_GREY "    lock#%-3d %p  first used at %s" C_OFF "\n",
-                c->e[i].from + 1, c->l[i].addr, where);
+        bprintf(&len, C_GREY "    lock#%-3d %p  %-9s first used at %s" C_OFF "\n",
+                c->e[i].from + 1, c->l[i].addr, kind_name(c->l[i].kind), where);
     }
     bprintf(&len, "\n");
 
     /* 3. One block per edge: which thread took which lock while holding which. */
     for (int i = 0; i < c->n; i++) {
         const Edge *e = &c->e[i];
-        bprintf(&len, C_BOLD "  Thread T%d took lock#%d while holding lock#%d" C_OFF "\n",
-                e->tid, e->to + 1, e->from + 1);
+        bprintf(&len, C_BOLD "  Thread T%d took lock#%d%s while holding lock#%d%s" C_OFF "\n",
+                e->tid, e->to + 1, mode_word(e->rkind, e->rmode),
+                e->from + 1, mode_word(e->hkind, e->hmode));
 
         describe(e->from_pc, where, sizeof where, NULL);
         bprintf(&len, C_GREY "      lock#%d was acquired at   %s" C_OFF "\n", e->from + 1, where);
@@ -698,7 +1079,20 @@ static void print_cycle(const Cycle *c)
         bprintf(&len, "\n");
     }
 
+    int has_rw = 0, has_sem = 0;
+    for (int i = 0; i < c->n; i++) {
+        if (c->e[i].hkind == KIND_RWLOCK || c->e[i].rkind == KIND_RWLOCK) has_rw = 1;
+        if (c->e[i].hkind == KIND_SEM    || c->e[i].rkind == KIND_SEM)    has_sem = 1;
+    }
     bprintf(&len, "  " C_GREEN "Fix:" C_OFF " make every thread take these locks in the same order.\n");
+    json_cycle(c);
+    if (has_rw)
+        bprintf(&len, C_GREY "  (Read locks only block writers. Every step of this cycle pairs a request\n"
+                      "  with a hold that really conflicts: write/write or read/write.)" C_OFF "\n");
+    if (has_sem)
+        bprintf(&len, C_GREY "  (A semaphore counts as a lock here because it was created with an\n"
+                      "  initial value of 1. If it is really used for signaling, ignore its part.)"
+                      C_OFF "\n");
     write_out(len);
     real_unlock(&g_print_mutex);
 }
@@ -719,10 +1113,16 @@ static void print_self_deadlock(const SelfDeadlock *s)
     resolve_batch(want, nw);
 
     bprintf(&len, "\n" C_RED "[LockSight] SELF-DEADLOCK #%d detected" C_OFF "\n\n", s->number);
-    bprintf(&len, "  Thread T%d asks for lock#%d, but it already holds that lock.\n"
-                  C_GREY "  A normal (non-recursive) mutex cannot be locked twice by the same\n"
-                  "  thread, so this thread will wait for itself forever." C_OFF "\n\n",
-            s->tid, s->id + 1);
+    if (s->kind == KIND_RWLOCK)
+        bprintf(&len, "  Thread T%d asks for a WRITE lock on lock#%d, but it already holds a READ lock on it.\n"
+                      C_GREY "  A read lock cannot be upgraded to a write lock: the write lock waits until\n"
+                      "  all readers are gone, and this thread is one of them." C_OFF "\n\n",
+                s->tid, s->id + 1);
+    else
+        bprintf(&len, "  Thread T%d asks for lock#%d, but it already holds that lock.\n"
+                      C_GREY "  A normal (non-recursive) mutex cannot be locked twice by the same\n"
+                      "  thread, so this thread will wait for itself forever." C_OFF "\n\n",
+                s->tid, s->id + 1);
 
     describe(s->lock.first_pc, where, sizeof where, NULL);
     bprintf(&len, C_GREY "    lock#%-3d %p  first used at %s" C_OFF "\n\n",
@@ -735,8 +1135,13 @@ static void print_self_deadlock(const SelfDeadlock *s)
     bprintf(&len, C_GREY "      lock#%d is requested again at  %s" C_OFF "\n", s->id + 1, where);
     bprint_callers(&len, s->req_stack, s->req_depth);
 
-    bprintf(&len, "\n  " C_GREEN "Fix:" C_OFF " unlock it before locking again, or create the mutex with\n"
-                  "  PTHREAD_MUTEX_RECURSIVE if locking it twice is intended.\n");
+    if (s->kind == KIND_RWLOCK)
+        bprintf(&len, "\n  " C_GREEN "Fix:" C_OFF " release the read lock first, or take the write lock "
+                      "from the start.\n");
+    else
+        bprintf(&len, "\n  " C_GREEN "Fix:" C_OFF " unlock it before locking again, or create the mutex with\n"
+                      "  PTHREAD_MUTEX_RECURSIVE if locking it twice is intended.\n");
+    json_self(s);
     write_out(len);
     real_unlock(&g_print_mutex);
 }
@@ -745,11 +1150,27 @@ static void print_self_deadlock(const SelfDeadlock *s)
 static void print_summary(void)
 {
     load_config();
-    if (g_quiet)
+    if (g_quiet && !g_jsonpath[0])
         return;
 
     size_t len = 0;
     real_lock(&g_print_mutex);
+
+    if (g_jsonpath[0]) {
+        json_begin("summary");
+        jprintf(",\"threads\":%d,\"locks_seen\":%d,\"locks_tracked\":%d,"
+                "\"lock_order_edges\":%d,\"potential_deadlocks\":%d,\"self_deadlocks\":%d,"
+                "\"semaphore_notes\":%d,\"table_limit_locks_dropped\":%d,"
+                "\"table_limit_edges_dropped\":%d,\"search_gave_up\":%d,\"result\":\"%s\"",
+                g_nthreads, g_nlocks_seen, g_nlocks_live, g_nedges_seen, g_ncycles, g_nself,
+                g_nnotes, g_dropped_locks, g_dropped_edges, g_budget_hits,
+                (g_ncycles + g_nself) > 0 ? "problems_found" : "no_problems");
+        json_end("");
+    }
+    if (g_quiet) {
+        real_unlock(&g_print_mutex);
+        return;
+    }
 
     int problems = g_ncycles + g_nself;
     bprintf(&len, "\n" C_BOLD "[LockSight] Summary" C_OFF "\n");
@@ -768,6 +1189,9 @@ static void print_summary(void)
     if (g_dropped_locks || g_dropped_edges)
         bprintf(&len, C_YELLOW "  note: table limits reached (%d lock(s), %d edge(s) not tracked)"
                       C_OFF "\n", g_dropped_locks, g_dropped_edges);
+    if (g_nnotes)
+        bprintf(&len, C_YELLOW "  note: %d semaphore(s) were used for signaling and are not tracked"
+                      C_OFF "\n", g_nnotes);
     if (g_budget_hits)
         bprintf(&len, C_YELLOW "  note: the cycle search gave up %d time(s) (very large lock graph)"
                       C_OFF "\n", g_budget_hits);
@@ -787,6 +1211,11 @@ static void strict_stop(void)
     real_lock(&g_print_mutex);
     bprintf(&len, "\n" C_RED "[LockSight] --strict: stopping the program now because of "
                   "the problem reported above." C_OFF "\n");
+    if (g_jsonpath[0]) {
+        json_begin("strict_stop");
+        jprintf(",\"exit_status\":3");
+        json_end("");
+    }
     emit(g_out, len);
     real_unlock(&g_print_mutex);
 
@@ -824,7 +1253,7 @@ static int find_lock(void *addr)
 }
 
 /* Find the id of the mutex at 'addr', adding it if we have not seen it yet. */
-static int lookup_or_add_lock(void *addr, void *pc)
+static int lookup_or_add_lock(void *addr, void *pc, int kind)
 {
     int id = find_lock(addr);
     if (id >= 0)
@@ -840,6 +1269,8 @@ static int lookup_or_add_lock(void *addr, void *pc)
     }
     g_locks[id].addr     = addr;
     g_locks[id].first_pc = pc;
+    g_locks[id].kind     = kind;
+    g_ord[id]            = ++g_next_ord;     /* a new lock goes last in the ordering */
 
     unsigned h = hash_addr(addr);
     while (g_slot[h] != 0)
@@ -899,28 +1330,217 @@ static void free_edge(int ei)
     g_edge_free[g_nedge_free++] = ei;
 }
 
+/* Edges are kept in three structures, all updated in O(1):
+ *   - the list of edges leaving 'from' (doubly linked),
+ *   - the list of edges entering 'to'  (doubly linked),
+ *   - a hash index on (from, to), so "do we already have this pair?" does not
+ *     have to walk a long list when one lock (a "hub") has very many edges. */
+
+static unsigned pair_bucket(int from, int to)
+{
+    uint64_t x = ((uint64_t)(unsigned)from << 32) | (unsigned)to;
+    x *= 0x9E3779B97F4A7C15ULL;
+    return (unsigned)((x >> 32) % PAIR_HASH);
+}
+
+static void link_edge(int ei)
+{
+    Edge *e = &g_edges[ei];
+
+    e->prev_out = 0;
+    e->next_out = g_first_out[e->from];
+    if (e->next_out)
+        g_edges[e->next_out - 1].prev_out = ei + 1;
+    g_first_out[e->from] = ei + 1;
+
+    e->prev_in = 0;
+    e->next_in = g_first_in[e->to];
+    if (e->next_in)
+        g_edges[e->next_in - 1].prev_in = ei + 1;
+    g_first_in[e->to] = ei + 1;
+
+    unsigned b = pair_bucket(e->from, e->to);
+    e->next_pair = g_pair_head[b];
+    g_pair_head[b] = ei + 1;
+}
+
 static void unlink_out(int from, int ei)
 {
-    int *p = &g_first_out[from];
-    while (*p != 0) {
-        if (*p - 1 == ei) {
-            *p = g_edges[ei].next_out;
-            return;
-        }
-        p = &g_edges[*p - 1].next_out;
-    }
+    Edge *e = &g_edges[ei];
+    if (e->prev_out)
+        g_edges[e->prev_out - 1].next_out = e->next_out;
+    else
+        g_first_out[from] = e->next_out;
+    if (e->next_out)
+        g_edges[e->next_out - 1].prev_out = e->prev_out;
 }
 
 static void unlink_in(int to, int ei)
 {
-    int *p = &g_first_in[to];
+    Edge *e = &g_edges[ei];
+    if (e->prev_in)
+        g_edges[e->prev_in - 1].next_in = e->next_in;
+    else
+        g_first_in[to] = e->next_in;
+    if (e->next_in)
+        g_edges[e->next_in - 1].prev_in = e->prev_in;
+}
+
+static void unlink_pair(int ei)
+{
+    int *p = &g_pair_head[pair_bucket(g_edges[ei].from, g_edges[ei].to)];
     while (*p != 0) {
         if (*p - 1 == ei) {
-            *p = g_edges[ei].next_in;
+            *p = g_edges[ei].next_pair;
             return;
         }
-        p = &g_edges[*p - 1].next_in;
+        p = &g_edges[*p - 1].next_pair;
     }
+}
+
+/* ---- Lock ordering (keeps most cycle searches from being necessary) ----
+ *
+ * Looking for a cycle every time an edge is added is expensive in a big graph
+ * (thousands of locks, a hundred thousand edges). But in a program WITHOUT a
+ * lock-order problem the plain graph has no cycle at all, and then its locks can
+ * be put in a line so that every edge points forward. We keep such a line
+ * (g_ord) up to date as edges arrive (the Pearce-Kelly algorithm): a new edge
+ * that already points forward cannot close a loop, so nothing has to be
+ * searched. Only an edge that points backward needs work: the nodes between its
+ * two ends are re-sorted, or, if it really closes a loop in the plain graph, it
+ * is flagged "back" and set aside (the line only covers the other edges).
+ * A loop must contain at least one such set-aside edge, which is what
+ * needs_search() uses to decide whether the full search has to run. This only
+ * SKIPS searches that cannot find anything; it never changes what is found. */
+
+static unsigned g_pkmark[MAX_LOCKS];
+static unsigned g_pkgen;
+static int      g_pkstack[MAX_LOCKS];
+static int      g_pkfwd[MAX_LOCKS], g_pkbwd[MAX_LOCKS];
+static uint64_t g_pkpool[MAX_LOCKS];
+
+static void back_forget(int ei)
+{
+    if (!g_edges[ei].back)
+        return;
+    for (int i = 0; i < g_nback; i++) {
+        if (g_back[i] == ei) {
+            g_back[i] = g_back[--g_nback];
+            break;
+        }
+    }
+    g_edges[ei].back = 0;
+}
+
+static int cmp_ord(const void *a, const void *b)
+{
+    uint64_t x = g_ord[*(const int *)a], y = g_ord[*(const int *)b];
+    return x < y ? -1 : x > y;
+}
+
+/* The edge 'ei' (u -> v) was just linked in. Keep the ordering valid.
+ * Returns 1 if the edge closes a loop in the plain graph (it is then set aside
+ * as a "back" edge), 0 otherwise. */
+static int order_add_edge(int ei)
+{
+    Edge *e = &g_edges[ei];
+    int u = e->from, v = e->to;
+    e->back = 0;
+    if (g_ord[u] < g_ord[v])
+        return 0;                               /* already points forward */
+
+    uint64_t lb = g_ord[v], ub = g_ord[u];
+    g_pkgen += 2;
+    unsigned gf = g_pkgen, gb = g_pkgen + 1;
+
+    /* forward from v, only through nodes before u in the line */
+    int nf = 0, sp = 0;
+    g_pkstack[sp++] = v;
+    g_pkmark[v] = gf;
+    while (sp > 0) {
+        int x = g_pkstack[--sp];
+        g_pkfwd[nf++] = x;
+        for (int f = g_first_out[x]; f != 0; f = g_edges[f - 1].next_out) {
+            const Edge *fe = &g_edges[f - 1];
+            if (fe->back || f - 1 == ei)
+                continue;
+            int y = fe->to;
+            if (y == u)
+                goto closes_loop;
+            if (g_ord[y] < ub && g_pkmark[y] != gf) {
+                g_pkmark[y] = gf;
+                g_pkstack[sp++] = y;
+            }
+        }
+    }
+
+    /* backward from u, only through nodes after v in the line */
+    int nb = 0;
+    sp = 0;
+    g_pkstack[sp++] = u;
+    g_pkmark[u] = gb;
+    while (sp > 0) {
+        int x = g_pkstack[--sp];
+        g_pkbwd[nb++] = x;
+        for (int f = g_first_in[x]; f != 0; f = g_edges[f - 1].next_in) {
+            const Edge *fe = &g_edges[f - 1];
+            if (fe->back || f - 1 == ei)
+                continue;
+            int y = fe->from;
+            if (g_ord[y] > lb && g_pkmark[y] != gb) {
+                g_pkmark[y] = gb;
+                g_pkstack[sp++] = y;
+            }
+        }
+    }
+
+    /* Re-sort: everything that leads to u goes before everything reachable from
+     * v, using the same set of positions. */
+    qsort(g_pkfwd, (size_t)nf, sizeof(int), cmp_ord);
+    qsort(g_pkbwd, (size_t)nb, sizeof(int), cmp_ord);
+    {
+        int i = 0, j = 0, k = 0;
+        while (i < nb || j < nf) {
+            if (j >= nf || (i < nb && g_ord[g_pkbwd[i]] < g_ord[g_pkfwd[j]]))
+                g_pkpool[k++] = g_ord[g_pkbwd[i++]];
+            else
+                g_pkpool[k++] = g_ord[g_pkfwd[j++]];
+        }
+        k = 0;
+        for (int a = 0; a < nb; a++)
+            g_ord[g_pkbwd[a]] = g_pkpool[k++];
+        for (int a = 0; a < nf; a++)
+            g_ord[g_pkfwd[a]] = g_pkpool[k++];
+    }
+    return 0;
+
+closes_loop:
+    e->back = 1;
+    if (g_nback < MAX_BACK)
+        g_back[g_nback++] = ei;
+    else
+        g_back_overflow = 1;
+    return 1;
+}
+
+/* Could the edge 'ei' be part of a loop of the plain graph? If not, the full
+ * search has nothing to find. */
+static int needs_search(int ei)
+{
+    const Edge *e = &g_edges[ei];
+    if (e->back || g_back_overflow)
+        return 1;
+    if (g_nback == 0)
+        return 0;                       /* every edge points forward: no loops at all */
+    /* A loop through this edge needs a set-aside edge reachable from e->to and
+     * one that leads back to e->from (possibly two different ones). */
+    int any_out = 0, any_in = 0;
+    for (int i = 0; i < g_nback; i++) {
+        const Edge *b = &g_edges[g_back[i]];
+        if (g_ord[b->from] >= g_ord[e->to])   any_out = 1;
+        if (g_ord[b->to]   <= g_ord[e->from]) any_in  = 1;
+    }
+    return any_out && any_in;
 }
 
 /* Forget a lock completely: all edges leaving or entering it, its address,
@@ -930,6 +1550,8 @@ static void drop_lock(int id)
     for (int e = g_first_out[id]; e != 0; ) {
         int ei = e - 1, nxt = g_edges[ei].next_out;
         unlink_in(g_edges[ei].to, ei);
+        unlink_pair(ei);
+        back_forget(ei);
         free_edge(ei);
         e = nxt;
     }
@@ -938,6 +1560,8 @@ static void drop_lock(int id)
     for (int e = g_first_in[id]; e != 0; ) {
         int ei = e - 1, nxt = g_edges[ei].next_in;
         unlink_out(g_edges[ei].from, ei);
+        unlink_pair(ei);
+        back_forget(ei);
         free_edge(ei);
         e = nxt;
     }
@@ -945,6 +1569,7 @@ static void drop_lock(int id)
 
     hash_remove(g_locks[id].addr);
     g_locks[id].addr = NULL;
+    g_locks[id].gen++;               /* every thread's memory of holding it is now void */
     g_lock_free[g_nlock_free++] = id;
     g_nlocks_live--;
 }
@@ -974,21 +1599,23 @@ static int capture_stack(void *pc, void **out, int cap)
  *     that was sometimes missing cannot be trusted as a gate).
  * Returns the index of the record if something NEW was learned (so a cycle
  * check is worthwhile), or -1 if nothing changed. */
-static int note_dependency(int from, int to, const uint64_t *held,
-                           void *from_pc, void *to_pc)
+static int note_dependency(int from, int to, const uint64_t *held, const uint64_t *hx,
+                           int hmode, int rmode, void *from_pc, void *to_pc)
 {
     int same_pair = 0;
-    for (int ei = g_first_out[from]; ei != 0; ei = g_edges[ei - 1].next_out) {
+    for (int ei = g_pair_head[pair_bucket(from, to)]; ei != 0; ei = g_edges[ei - 1].next_pair) {
         Edge *e = &g_edges[ei - 1];
-        if (e->to != to)
+        if (e->from != from || e->to != to || e->hmode != hmode || e->rmode != rmode)
             continue;
         same_pair++;
         if (e->tid == t_tid) {
             int changed = 0;
             for (int w = 0; w < GATE_WORDS; w++) {
                 uint64_t now = e->held[w] & held[w];
-                if (now != e->held[w]) {
+                uint64_t nx  = e->hx[w] & hx[w];
+                if (now != e->held[w] || nx != e->hx[w]) {
                     e->held[w] = now;
+                    e->hx[w]   = nx;
                     changed = 1;
                 }
             }
@@ -1005,12 +1632,15 @@ static int note_dependency(int from, int to, const uint64_t *held,
     e->from = from;
     e->to   = to;
     e->tid  = t_tid;
+    e->hmode = (unsigned char)hmode;
+    e->rmode = (unsigned char)rmode;
+    e->hkind = (unsigned char)g_locks[from].kind;
+    e->rkind = (unsigned char)g_locks[to].kind;
     memcpy(e->held, held, sizeof e->held);
+    memcpy(e->hx, hx, sizeof e->hx);
     e->from_pc  = from_pc;
-    e->next_out = g_first_out[from];
-    g_first_out[from] = ei + 1;
-    e->next_in  = g_first_in[to];
-    g_first_in[to] = ei + 1;
+    link_edge(ei);
+    order_add_edge(ei);
     e->to_depth = capture_stack(to_pc, e->to_stack, MAX_FRAMES);
     g_nedges_seen++;
     return ei;
@@ -1019,13 +1649,16 @@ static int note_dependency(int from, int to, const uint64_t *held,
 /* ---- Finding a dangerous cycle ---- */
 
 /* Can records a and b be two links of the same real deadlock? They must come
- * from different threads, and the threads must hold no lock in common. */
+ * from different threads, and the threads must be able to hold their locks AT
+ * THE SAME TIME. That fails if both hold the same lock and at least one of them
+ * holds it exclusively (a "gate" lock). Two readers of the same rwlock do not
+ * keep each other out, so a shared lock is not a gate between readers. */
 static int compatible(const Edge *a, const Edge *b)
 {
     if (a->tid == b->tid)
         return 0;
     for (int w = 0; w < GATE_WORDS; w++)
-        if (a->held[w] & b->held[w])
+        if ((a->held[w] & b->hx[w]) || (a->hx[w] & b->held[w]))
             return 0;                   /* a common "gate" lock protects both */
     return 1;
 }
@@ -1035,10 +1668,12 @@ static int compatible(const Edge *a, const Edge *b)
  * chain so far are in g_chosen[0 .. g_depth-1]. */
 static int search(int cur, int target)
 {
-    if (--g_budget < 0 || g_depth >= MAX_DEPTH)
+    if (g_depth >= MAX_DEPTH)
         return 0;
 
     for (int ei = g_first_out[cur]; ei != 0; ei = g_edges[ei - 1].next_out) {
+        if (--g_budget < 0)                      /* every edge looked at costs 1 */
+            return 0;
         const Edge *e = &g_edges[ei - 1];
 
         int ok = 1;
@@ -1051,7 +1686,15 @@ static int search(int cur, int target)
         if (!ok)
             continue;
 
+        /* Link to the previous record: what the previous thread REQUESTS must
+         * clash with how this thread HOLDS the same lock (a writer waits for a
+         * reader, but a reader does not wait for another reader). */
+        if (!conflicts(g_edges[g_chosen[g_depth - 1]].rmode, e->hmode))
+            continue;
+
         if (e->to == target) {                   /* the loop is closed */
+            if (!conflicts(e->rmode, g_edges[g_chosen[0]].hmode))
+                continue;
             g_chosen[g_depth++] = ei - 1;
             return 1;
         }
@@ -1071,6 +1714,12 @@ static int search(int cur, int target)
 /* Does the record e0 (from -> to) close a dangerous cycle? */
 static int find_cycle(int e0)
 {
+    if (!needs_search(e0))
+        return 0;                                /* cannot be part of any loop */
+    if (g_search_total >= SEARCH_TOTAL) {        /* this process has searched enough */
+        g_budget_hits++;
+        return 0;
+    }
     const Edge *first = &g_edges[e0];
     g_gen++;
     if (g_gen == 0)
@@ -1081,6 +1730,7 @@ static int find_cycle(int e0)
     g_budget    = SEARCH_BUDGET;
 
     int found = search(first->to, first->from);
+    g_search_total += SEARCH_BUDGET - (g_budget < 0 ? 0 : g_budget);
     if (!found && g_budget < 0)
         g_budget_hits++;
     g_mark[first->to] = 0;
@@ -1091,42 +1741,68 @@ static int find_cycle(int e0)
 /* Part 4: what happens just before a lock is taken                     */
 /* ================================================================== */
 
-/* Returns the lock id (or -1). If a new problem appears, it is printed. */
-static int on_before_lock(void *addr, void *pc)
+/* Returns the lock id (or -1) and the lock's generation in *gen_out.
+ * kind/mode say what is being asked for (see KIND_* and MODE_*).
+ * If a new problem appears, it is printed. */
+static int on_before_lock(void *addr, void *pc, int kind, int mode, unsigned *gen_out)
 {
     Cycle        cyc;
     SelfDeadlock sd;
     int          have_self = 0;
     cyc.n = 0;
+    *gen_out = 0;
 
     if (t_tid == 0)
         t_tid = __atomic_add_fetch(&g_nthreads, 1, __ATOMIC_RELAXED);
 
-    /* The set of locks this thread holds right now (used to find gate locks). */
-    uint64_t held[GATE_WORDS];
-    memset(held, 0, sizeof held);
-    for (int i = 0; i < t_nheld; i++) {
-        int hid = t_held[i].id;
-        if (hid >= 0 && hid < GATE_BITS)
-            held[hid >> 6] |= 1ULL << (hid & 63);
-    }
-
     real_lock(&g_mutex);
 
-    int id = lookup_or_add_lock(addr, pc);
+    /* The locks this thread holds right now (used to find gate locks).
+     * An entry whose lock was flushed since (a hand-off to another thread, a
+     * semaphore posted by someone else, or the address re-initialised) is
+     * stale: it is dropped here instead of being believed. */
+    uint64_t held[GATE_WORDS], hx[GATE_WORDS];
+    memset(held, 0, sizeof held);
+    memset(hx, 0, sizeof hx);
+    int keep = 0;
+    for (int i = 0; i < t_nheld; i++) {
+        int hid = t_held[i].id;
+        if (hid < 0 || g_locks[hid].addr != t_held[i].addr ||
+            g_locks[hid].gen != t_held[i].gen)
+            continue;
+        t_held[keep++] = t_held[i];
+        if (hid < GATE_BITS) {
+            held[hid >> 6] |= 1ULL << (hid & 63);
+            if (t_held[i].mode == MODE_X)
+                hx[hid >> 6] |= 1ULL << (hid & 63);
+        }
+    }
+    t_nheld = keep;
+
+    /* A semaphore is only tracked if sem_init made it known (see sem_init). */
+    int id = (kind == KIND_SEM) ? find_lock(addr) : lookup_or_add_lock(addr, pc, kind);
     if (id >= 0) {
+        *gen_out = g_locks[id].gen;
         for (int i = 0; i < t_nheld; i++) {
             int h = t_held[i].id;
-            if (h < 0)
-                continue;
 
             if (h == id) {
                 /* The thread already holds this very lock. For a normal mutex
                  * that means it will wait for itself forever. Recursive and
-                 * error-checking mutexes are allowed to be locked again. */
-                int kind = ((pthread_mutex_t *)addr)->__data.__kind & 3;
-                if (!have_self &&
-                    (kind == PTHREAD_MUTEX_NORMAL || kind == PTHREAD_MUTEX_ADAPTIVE_NP)) {
+                 * error-checking mutexes are allowed to be locked again. For
+                 * an rwlock, only "read lock held, write lock requested" (an
+                 * upgrade) hangs; a second read lock is fine, and a write lock
+                 * that is requested twice makes glibc return EDEADLK instead
+                 * of hanging. A semaphore that is waited on twice may simply
+                 * be waiting for another thread's sem_post: no verdict. */
+                int self = 0;
+                if (kind == KIND_MUTEX) {
+                    int mk = ((pthread_mutex_t *)addr)->__data.__kind & 3;
+                    self = (mk == PTHREAD_MUTEX_NORMAL || mk == PTHREAD_MUTEX_ADAPTIVE_NP);
+                } else if (kind == KIND_RWLOCK) {
+                    self = (t_held[i].mode == MODE_S && mode == MODE_X);
+                }
+                if (self && !have_self) {
                     have_self       = 1;
                     sd.lock         = g_locks[id];
                     sd.held_pc      = t_held[i].pc;
@@ -1134,11 +1810,13 @@ static int on_before_lock(void *addr, void *pc)
                     sd.id           = id;
                     sd.tid          = t_tid;
                     sd.number       = ++g_nself;
+                    sd.kind         = kind;
                 }
                 continue;
             }
 
-            int e0 = note_dependency(h, id, held, t_held[i].pc, pc);
+            int e0 = note_dependency(h, id, held, hx, t_held[i].mode, mode,
+                                     t_held[i].pc, pc);
             if (e0 >= 0 && cyc.n == 0 && find_cycle(e0)) {
                 g_ncycles++;
                 cyc.total  = g_depth;
@@ -1177,80 +1855,75 @@ static int on_before_lock(void *addr, void *pc)
  * passed straight to the real functions and are not tracked.
  */
 
-int pthread_mutex_lock(pthread_mutex_t *m)
+/* ---- the calling thread's list of held locks ---- */
+
+static void add_hold(void *obj, int id, unsigned gen, int mode, void *pc)
 {
-    init_real();
-    if (t_busy)
-        return real_lock(m);
-
-    void *pc = __builtin_return_address(0);
-    t_busy = 1;
-    int id = on_before_lock(m, pc);     /* record edges + look for problems FIRST */
-    t_busy = 0;
-
-    int rc = real_lock(m);              /* ...then really take the lock           */
-    if (rc == 0 && t_nheld < MAX_HELD) {
-        t_held[t_nheld].addr = m;
-        t_held[t_nheld].id   = id;
-        t_held[t_nheld].pc   = pc;
-        t_nheld++;
-    }
-    return rc;
+    if (id < 0 || t_nheld >= MAX_HELD)
+        return;
+    t_held[t_nheld].addr = obj;
+    t_held[t_nheld].id   = id;
+    t_held[t_nheld].mode = mode;
+    t_held[t_nheld].gen  = gen;
+    t_held[t_nheld].pc   = pc;
+    t_nheld++;
 }
 
-/* trylock never waits, so it cannot be part of a deadlock by itself: we add
- * no edge for it. But if it succeeds the thread now HOLDS the lock, and locks
- * taken later while holding it must still be recorded. */
-int pthread_mutex_trylock(pthread_mutex_t *m)
+/* Forget the newest hold of 'obj' (locks may be released in any order).
+ * Returns 1 if this thread had it in its list. */
+static int remove_hold(void *obj)
 {
-    init_real();
-    int rc = real_trylock(m);
-    if (rc == 0 && !t_busy && t_nheld < MAX_HELD) {
-        void *pc = __builtin_return_address(0);
-        t_busy = 1;
-        if (t_tid == 0)
-            t_tid = __atomic_add_fetch(&g_nthreads, 1, __ATOMIC_RELAXED);
-        real_lock(&g_mutex);
-        int id = lookup_or_add_lock(m, pc);
-        real_unlock(&g_mutex);
-        t_busy = 0;
-
-        t_held[t_nheld].addr = m;
-        t_held[t_nheld].id   = id;
-        t_held[t_nheld].pc   = pc;
-        t_nheld++;
-    }
-    return rc;
-}
-
-int pthread_mutex_unlock(pthread_mutex_t *m)
-{
-    init_real();
-    /* Forget the lock (search from the newest; locks may be released in any order). */
     for (int i = t_nheld - 1; i >= 0; i--) {
-        if (t_held[i].addr == m) {
+        if (t_held[i].addr == obj) {
             for (int j = i; j < t_nheld - 1; j++)
                 t_held[j] = t_held[j + 1];
             t_nheld--;
-            break;
+            return 1;
         }
     }
-    return real_unlock(m);
+    return 0;
 }
 
-/* The same memory address can hold a different mutex later (a mutex is
+/* A lock was taken without waiting (trylock, timed lock): the thread now HOLDS
+ * it, so locks taken later while holding it must be recorded, but no edge is
+ * added for the try itself (it cannot block forever). */
+static void note_acquired_nowait(void *obj, int kind, int mode, void *pc)
+{
+    if (t_busy || t_nheld >= MAX_HELD)
+        return;
+    t_busy = 1;
+    if (t_tid == 0)
+        t_tid = __atomic_add_fetch(&g_nthreads, 1, __ATOMIC_RELAXED);
+    real_lock(&g_mutex);
+    int id = (kind == KIND_SEM) ? find_lock(obj) : lookup_or_add_lock(obj, pc, kind);
+    unsigned gen = id >= 0 ? g_locks[id].gen : 0;
+    real_unlock(&g_mutex);
+    t_busy = 0;
+    add_hold(obj, id, gen, mode, pc);
+}
+
+/* Somebody who does not hold 'obj' released it (a lock handed from one thread
+ * to another). Whoever "held" it according to their own list is wrong now, so
+ * raise the generation: every such entry becomes stale and is ignored. */
+static void invalidate_holds(void *obj)
+{
+    t_busy = 1;
+    real_lock(&g_mutex);
+    int id = find_lock(obj);
+    if (id >= 0)
+        g_locks[id].gen++;
+    real_unlock(&g_mutex);
+    t_busy = 0;
+}
+
+/* The same memory address can hold a different lock later (a lock is
  * destroyed and another is created in the same place, or freed memory is
  * reused). Whatever we learned about the old one must not leak into the new
  * one, so on init and destroy we forget the address completely. */
-static void forget_mutex(void *addr)
+static void forget_lock(void *addr)
 {
-    for (int i = t_nheld - 1; i >= 0; i--) {     /* also in this thread's own list */
-        if (t_held[i].addr == addr) {
-            for (int j = i; j < t_nheld - 1; j++)
-                t_held[j] = t_held[j + 1];
-            t_nheld--;
-        }
-    }
+    while (remove_hold(addr))                    /* also in this thread's own list */
+        ;
     t_busy = 1;
     real_lock(&g_mutex);
     int id = find_lock(addr);
@@ -1260,11 +1933,60 @@ static void forget_mutex(void *addr)
     t_busy = 0;
 }
 
+/* ---- mutexes ---- */
+
+int pthread_mutex_lock(pthread_mutex_t *m)
+{
+    init_real();
+    if (t_busy)
+        return real_lock(m);
+
+    void *pc = __builtin_return_address(0);
+    unsigned gen;
+    t_busy = 1;
+    int id = on_before_lock(m, pc, KIND_MUTEX, MODE_X, &gen);   /* edges + problems FIRST */
+    t_busy = 0;
+
+    int rc = real_lock(m);              /* ...then really take the lock           */
+    if (rc == 0)
+        add_hold(m, id, gen, MODE_X, pc);
+    return rc;
+}
+
+/* trylock never waits, so it cannot be part of a deadlock by itself: we add
+ * no edge for it. */
+int pthread_mutex_trylock(pthread_mutex_t *m)
+{
+    init_real();
+    int rc = real_trylock(m);
+    if (rc == 0)
+        note_acquired_nowait(m, KIND_MUTEX, MODE_X, __builtin_return_address(0));
+    return rc;
+}
+
+int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *ts)
+{
+    init_real();
+    int rc = real_timedlock(m, ts);     /* gives up after a while: like trylock */
+    if (rc == 0)
+        note_acquired_nowait(m, KIND_MUTEX, MODE_X, __builtin_return_address(0));
+    return rc;
+}
+
+int pthread_mutex_unlock(pthread_mutex_t *m)
+{
+    init_real();
+    int mine = remove_hold(m);
+    if (!mine && !t_busy)
+        invalidate_holds(m);            /* released by a thread that never took it */
+    return real_unlock(m);
+}
+
 int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *attr)
 {
     init_real();
     if (!t_busy)
-        forget_mutex(m);
+        forget_lock(m);
     return real_init(m, attr);
 }
 
@@ -1272,8 +1994,248 @@ int pthread_mutex_destroy(pthread_mutex_t *m)
 {
     init_real();
     if (!t_busy)
-        forget_mutex(m);
+        forget_lock(m);
     return real_destroy(m);
+}
+
+/* ---- read-write locks ---- */
+
+int pthread_rwlock_rdlock(pthread_rwlock_t *l)
+{
+    init_real();
+    if (t_busy)
+        return real_rdlock(l);
+    void *pc = __builtin_return_address(0);
+    unsigned gen;
+    t_busy = 1;
+    int id = on_before_lock(l, pc, KIND_RWLOCK, MODE_S, &gen);
+    t_busy = 0;
+    int rc = real_rdlock(l);
+    if (rc == 0)
+        add_hold(l, id, gen, MODE_S, pc);
+    return rc;
+}
+
+int pthread_rwlock_wrlock(pthread_rwlock_t *l)
+{
+    init_real();
+    if (t_busy)
+        return real_wrlock(l);
+    void *pc = __builtin_return_address(0);
+    unsigned gen;
+    t_busy = 1;
+    int id = on_before_lock(l, pc, KIND_RWLOCK, MODE_X, &gen);
+    t_busy = 0;
+    int rc = real_wrlock(l);
+    if (rc == 0)
+        add_hold(l, id, gen, MODE_X, pc);
+    return rc;
+}
+
+int pthread_rwlock_tryrdlock(pthread_rwlock_t *l)
+{
+    init_real();
+    int rc = real_tryrdlock(l);
+    if (rc == 0)
+        note_acquired_nowait(l, KIND_RWLOCK, MODE_S, __builtin_return_address(0));
+    return rc;
+}
+
+int pthread_rwlock_trywrlock(pthread_rwlock_t *l)
+{
+    init_real();
+    int rc = real_trywrlock(l);
+    if (rc == 0)
+        note_acquired_nowait(l, KIND_RWLOCK, MODE_X, __builtin_return_address(0));
+    return rc;
+}
+
+int pthread_rwlock_timedrdlock(pthread_rwlock_t *l, const struct timespec *ts)
+{
+    init_real();
+    int rc = real_timedrdlock(l, ts);
+    if (rc == 0)
+        note_acquired_nowait(l, KIND_RWLOCK, MODE_S, __builtin_return_address(0));
+    return rc;
+}
+
+int pthread_rwlock_timedwrlock(pthread_rwlock_t *l, const struct timespec *ts)
+{
+    init_real();
+    int rc = real_timedwrlock(l, ts);
+    if (rc == 0)
+        note_acquired_nowait(l, KIND_RWLOCK, MODE_X, __builtin_return_address(0));
+    return rc;
+}
+
+/* One unlock call for both read and write locks. Several readers can hold the
+ * same rwlock, so a release by a thread that does not hold it is ignored (we
+ * cannot tell whose hold it was). */
+int pthread_rwlock_unlock(pthread_rwlock_t *l)
+{
+    init_real();
+    remove_hold(l);
+    return real_rw_unlock(l);
+}
+
+int pthread_rwlock_init(pthread_rwlock_t *l, const pthread_rwlockattr_t *attr)
+{
+    init_real();
+    if (!t_busy)
+        forget_lock(l);
+    return real_rw_init(l, attr);
+}
+
+int pthread_rwlock_destroy(pthread_rwlock_t *l)
+{
+    init_real();
+    if (!t_busy)
+        forget_lock(l);
+    return real_rw_destroy(l);
+}
+
+/* ---- binary semaphores used as locks ----
+ *
+ * A semaphore has no owner. LockSight treats a semaphore as a LOCK only when
+ * it was created with sem_init(&s, 0, 1): a binary semaphore, the classic
+ * "mutex made of a semaphore". The thread that sem_wait()s it is its owner
+ * until it sem_post()s it. Semaphores created with any other initial value are
+ * used for signaling ("a message has arrived") and are not tracked at all.
+ *
+ * If a semaphore that looked like a lock is posted by a thread that did not
+ * wait on it, it is really being used for signaling. LockSight prints a note
+ * and removes it (and all edges through it) from the graph. Threads that
+ * thought they held it find out through the generation number (see
+ * LockInfo.gen), so nothing in any thread's own list is touched from outside. */
+
+static void print_sem_note(void *sem, void *pc, int tid)
+{
+    char where[600];
+    size_t len = 0;
+
+    load_config();
+    if (g_quiet && !g_jsonpath[0])
+        return;
+    real_lock(&g_print_mutex);
+    describe(pc, where, sizeof where, NULL);
+    if (g_jsonpath[0]) {
+        json_begin("note");
+        jprintf(",\"note\":\"semaphore_signaling\",\"thread\":%d,"
+                "\"semaphore\":\"%p\",\"posted_at\":", tid, sem);
+        jloc(pc);
+        jprintf(",\"message\":\"semaphore posted by a thread that did not wait on it; "
+                "treated as a signal and no longer tracked\"");
+        json_end("");
+    }
+    if (g_quiet) {
+        real_unlock(&g_print_mutex);
+        return;
+    }
+    bprintf(&len, "\n" C_YELLOW "[LockSight] note: semaphore %p was posted by thread T%d, "
+                  "which did not wait on it" C_OFF "\n", sem, tid);
+    bprintf(&len, C_GREY "      sem_post called at %s\n"
+                  "      It is used for signaling, not as a lock, so LockSight stops "
+                  "tracking it." C_OFF "\n", where);
+    emit(g_out, len);
+    real_unlock(&g_print_mutex);
+}
+
+int sem_init(sem_t *s, int pshared, unsigned int value)
+{
+    init_real();
+    if (!t_busy) {
+        forget_lock(s);
+        if (pshared == 0 && value == 1) {
+            void *pc = __builtin_return_address(0);
+            t_busy = 1;
+            real_lock(&g_mutex);
+            lookup_or_add_lock(s, pc, KIND_SEM);
+            real_unlock(&g_mutex);
+            t_busy = 0;
+        }
+    }
+    return real_sem_init(s, pshared, value);
+}
+
+int sem_destroy(sem_t *s)
+{
+    init_real();
+    if (!t_busy)
+        forget_lock(s);
+    return real_sem_destroy(s);
+}
+
+int sem_wait(sem_t *s)
+{
+    init_real();
+    if (t_busy)
+        return real_sem_wait(s);
+    void *pc = __builtin_return_address(0);
+    unsigned gen;
+    t_busy = 1;
+    int id = on_before_lock(s, pc, KIND_SEM, MODE_X, &gen);
+    t_busy = 0;
+    int rc = real_sem_wait(s);
+    if (rc == 0)
+        add_hold(s, id, gen, MODE_X, pc);
+    return rc;
+}
+
+int sem_trywait(sem_t *s)
+{
+    init_real();
+    int rc = real_sem_trywait(s);
+    if (rc == 0)
+        note_acquired_nowait(s, KIND_SEM, MODE_X, __builtin_return_address(0));
+    return rc;
+}
+
+int sem_timedwait(sem_t *s, const struct timespec *ts)
+{
+    init_real();
+    int rc = real_sem_timedwait(s, ts);
+    if (rc == 0)
+        note_acquired_nowait(s, KIND_SEM, MODE_X, __builtin_return_address(0));
+    return rc;
+}
+
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 30)
+int sem_clockwait(sem_t *s, clockid_t clk, const struct timespec *ts)
+{
+    init_real();
+    int rc = real_sem_clockwait(s, clk, ts);
+    if (rc == 0)
+        note_acquired_nowait(s, KIND_SEM, MODE_X, __builtin_return_address(0));
+    return rc;
+}
+#endif
+#endif
+
+int sem_post(sem_t *s)
+{
+    init_real();
+    if (!t_busy && !remove_hold(s)) {
+        /* This thread did not wait on the semaphore. If we track it, it is
+         * being used for signaling: drop it from tracking and say so. */
+        void *pc = __builtin_return_address(0);
+        int dropped = 0;
+        t_busy = 1;
+        if (t_tid == 0)
+            t_tid = __atomic_add_fetch(&g_nthreads, 1, __ATOMIC_RELAXED);
+        real_lock(&g_mutex);
+        int id = find_lock(s);
+        if (id >= 0 && g_locks[id].kind == KIND_SEM) {
+            drop_lock(id);
+            g_nnotes++;
+            dropped = 1;
+        }
+        real_unlock(&g_mutex);
+        if (dropped)
+            print_sem_note(s, pc, t_tid);
+        t_busy = 0;
+    }
+    return real_sem_post(s);
 }
 
 /* ================================================================== */

@@ -1,0 +1,32 @@
+
+[LockSight] Summary
+  threads that used locks   1
+  locks seen                1  (1 still tracked)
+  lock-order edges          0
+  potential deadlocks       0
+  self-deadlocks            0
+  result                    NO PROBLEMS FOUND
+
+[LockSight] Summary
+  threads that used locks   2
+  locks seen                6  (3 still tracked)
+  lock-order edges          0
+  potential deadlocks       0
+  self-deadlocks            0
+  result                    NO PROBLEMS FOUND
+
+[LockSight] Summary
+  threads that used locks   1
+  locks seen                1  (1 still tracked)
+  lock-order edges          0
+  potential deadlocks       0
+  self-deadlocks            0
+  result                    NO PROBLEMS FOUND
+
+[LockSight] Summary
+  threads that used locks   1
+  locks seen                1  (1 still tracked)
+  lock-order edges          0
+  potential deadlocks       0
+  self-deadlocks            0
+  result                    NO PROBLEMS FOUND

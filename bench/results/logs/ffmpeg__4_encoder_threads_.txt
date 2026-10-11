@@ -1,0 +1,8 @@
+
+[LockSight] Summary
+  threads that used locks   19
+  locks seen                47  (6 still tracked)
+  lock-order edges          19
+  potential deadlocks       0
+  self-deadlocks            0
+  result                    NO PROBLEMS FOUND

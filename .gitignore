@@ -23,3 +23,17 @@ tests/random_orders
 *.log
 report.txt
 *.tmp
+bench/build/
+bench/bench_locks
+bench/stress_locks
+bench/maxrss
+tests/*
+!tests/*.c
+!tests/*.h
+!tests/*.sh
+bench/extra/*
+!bench/extra/*.c
+!bench/extra/*.cpp
+*~
+*.swp
+.DS_Store

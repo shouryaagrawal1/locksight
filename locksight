@@ -21,11 +21,15 @@ Usage:
 Options (they go BEFORE the program name):
   --quiet       only print warnings, no summary
   --log FILE    also save the full report to FILE (plain text, no colors)
+  --json FILE   also write one JSON object per line to FILE (JSON Lines), for
+                scripts and dashboards: events potential_deadlock,
+                self_deadlock, note and summary
   --strict      stop the program the moment a problem is found
 
 Examples:
   locksight run ./my_program
   locksight run --log report.txt ./my_program --its-own-option
+  locksight run --json events.jsonl ./my_program
   locksight run --strict ./my_program
 
 Exit status:
@@ -54,6 +58,7 @@ esac
 quiet=0
 strict=0
 logfile=""
+jsonfile=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --quiet)   quiet=1;  shift ;;
@@ -61,6 +66,9 @@ while [ $# -gt 0 ]; do
         --log)     [ $# -ge 2 ] || die "--log needs a file name"
                    logfile=$2; shift 2 ;;
         --log=*)   logfile=${1#--log=}; shift ;;
+        --json)    [ $# -ge 2 ] || die "--json needs a file name"
+                   jsonfile=$2; shift 2 ;;
+        --json=*)  jsonfile=${1#--json=}; shift ;;
         --)        shift; break ;;
         -*)        die "unknown option '$1' (try: locksight --help)" ;;
         *)         break ;;       # the first non-option is the program
@@ -96,6 +104,10 @@ if [ -n "$logfile" ]; then
     : > "$logfile" 2>/dev/null || die "cannot write to log file '$logfile'"
     logfile_abs=$(readlink -f -- "$logfile")   # absolute: the program may change directory
 fi
+if [ -n "$jsonfile" ]; then
+    : > "$jsonfile" 2>/dev/null || die "cannot write to JSON file '$jsonfile'"
+    jsonfile_abs=$(readlink -f -- "$jsonfile")
+fi
 STATUS=$(mktemp) || die "cannot create a temporary file"
 trap 'rm -f "$STATUS"' EXIT
 
@@ -105,6 +117,7 @@ export LOCKSIGHT_STATUS="$STATUS"
 [ "$quiet"  = 1 ] && export LOCKSIGHT_QUIET=1
 [ "$strict" = 1 ] && export LOCKSIGHT_STRICT=1
 [ -n "$logfile" ] && export LOCKSIGHT_LOG="$logfile_abs"
+[ -n "$jsonfile" ] && export LOCKSIGHT_JSON="$jsonfile_abs"
 
 # If the user presses Ctrl-C, the program (but not this script) should stop, so
 # that we can still report what was found. A handler (unlike "ignore") is
@@ -126,6 +139,9 @@ if [ "$problems" -gt 0 ] && [ "$quiet" = 0 ] && [ "$summary_printed" -eq 0 ]; th
 fi
 if [ -n "$logfile" ] && [ "$quiet" = 0 ]; then
     echo "[LockSight] report saved to $logfile" >&2
+fi
+if [ -n "$jsonfile" ] && [ "$quiet" = 0 ]; then
+    echo "[LockSight] JSON events saved to $jsonfile" >&2
 fi
 
 if [ "$problems" -gt 0 ]; then

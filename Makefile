@@ -2,6 +2,7 @@
 #
 #   make          build the library and all test programs
 #   make lib      build only src/liblocksight.so
+#                 (bigger tables: make lib LIMITS="-DMAX_LOCKS=1000000 -DMAX_EDGES=1000000")
 #   make tests    build only the test programs
 #   make demo     run one test program under LockSight
 #   make install  install the 'locksight' command (PREFIX=~/.local by default)
@@ -19,12 +20,16 @@ PREFIX ?= $(HOME)/.local
 CFLAGS  = -g -O0 -Wall -Wextra -pthread
 
 LIB        = src/liblocksight.so
-LIB_CFLAGS = -shared -fPIC -O2 -g -Wall -Wextra -pthread
+LIMITS     =
+LIB_CFLAGS = -shared -fPIC -O2 -g -Wall -Wextra -pthread $(LIMITS)
 
 TEST_NAMES = classic_deadlock three_lock_cycle safe_ordered bank_transfer dining_philosophers \
              single_thread_both_orders gate_lock partial_gate self_deadlock recursive_ok \
              errorcheck_ok trylock_case mutex_reuse many_locks big_ring worker_pool_outlier \
-             random_orders
+             random_orders \
+             rwlock_mixed rwlock_rw_cycle rwlock_readers_ok rwlock_oneway_ok rwlock_gate \
+             rwlock_upgrade sem_binary_deadlock sem_binary_ok sem_handoff_ok mutex_handoff_ok \
+             random_rw random_many hub_many
 TEST_BINS  = $(addprefix tests/, $(TEST_NAMES))
 
 .PHONY: all lib launcher tests demo check install uninstall clean
